@@ -27,9 +27,9 @@ ARG POSTBASE_REF=main
 RUN git clone --depth 1 --branch "${POSTBASE_REF}" "${POSTBASE_REPO}" .
 # 2. Install workspace dependencies from the committed lockfile.
 RUN pnpm install --frozen-lockfile
-# 3. Overlay the Swagger /docs route + OpenAPI generator owned by this repo.
-#    (Upstream ships a partial Swagger UI at /docs/api; we add /docs and a
-#    serverless-safe /docs/openapi.json.)
+# 3. Overlay the Swagger /docs route, the /mcp MCP endpoint and the OpenAPI
+#    generator owned by this repo. (Upstream ships a partial Swagger UI at
+#    /docs/api; we add /docs, a serverless-safe /docs/openapi.json and /mcp.)
 COPY docker/web-override/apps/web/ /app/apps/web/
 # 4. Freeze the REST part of the spec from the @swagger JSDoc in src/app/api
 #    while the sources are still present (they are NOT shipped at runtime).

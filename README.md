@@ -101,6 +101,8 @@ How it is wired (all owned by this repo, so no upstream changes are needed):
 | --- | --- |
 | `docker/web-override/apps/web/src/app/docs/page.tsx` | The `/docs` page (Swagger UI). |
 | `docker/web-override/apps/web/src/app/docs/openapi.json/route.ts` | Serves `/docs/openapi.json`. |
+| `docker/web-override/apps/web/src/app/mcp/route.ts` | The MCP server at `/mcp` (Streamable HTTP), auto-generated from the spec. |
+| `docker/web-override/apps/web/src/lib/openapi-spec.ts` | Shared spec builder used by `/docs/openapi.json` **and** `/mcp`. |
 | `docker/web-override/apps/web/src/lib/openapi-from-db.ts` | Introspects PostgreSQL → OpenAPI schemas. |
 | `docker/web-override/apps/web/scripts/generate-openapi.mjs` | Build-time: freezes the REST spec from the `@swagger` comments. |
 
@@ -111,6 +113,46 @@ scan (used by the built-in `/docs/api`) has nothing to read in production; `/doc
 instead reads the frozen JSON and adds the database schemas at runtime.
 
 > `/docs/api` (upstream) is left untouched; `/docs` is the supported entry point.
+
+## MCP endpoint (`/mcp`)
+
+Postbase also exposes an **MCP server at `/mcp`**, auto-generated from the same
+OpenAPI document as `/docs`. It "detects" the Swagger spec (the `@swagger` REST
+endpoints **plus** the live `proj_*` tables) and turns every operation into a
+callable MCP tool. There are **no extra dependencies**: the JSON-RPC 2.0 /
+Streamable-HTTP layer lives in the overlay.
+
+| MCP method | Behaviour |
+| --- | --- |
+| `initialize` | Returns server info, capabilities and usage instructions. |
+| `tools/list` | One tool per OpenAPI operation (e.g. `post_api_db_query`, `post_api_db_sql`, `post_api_rpc`). |
+| `tools/call` | Runs the operation by proxying to this instance's own REST API. |
+| `ping`, `resources/list`, `prompts/list` | Handled; resources and prompts are empty. |
+
+Point an MCP client at the Streamable-HTTP URL:
+
+```json
+{
+  "mcpServers": {
+    "postbase": {
+      "url": "https://my-postbase.example.com/mcp",
+      "headers": { "Authorization": "Bearer pb_anon_REPLACE_ME" }
+    }
+  }
+}
+```
+
+**Authentication** — send the Postbase key as `Authorization: Bearer pb_anon_…`
+(respects Row Level Security) or `pb_service_…` (bypasses RLS). Optionally add
+`X-Postbase-Token: <user JWT>` to run a tool as a specific end user. The key and
+headers are forwarded to the underlying endpoint, so **RLS and project scoping
+behave exactly as in a direct API call**.
+
+`tools/call` only ever calls paths that exist in the OpenAPI document, so there
+is no way to reach an arbitrary URL through `/mcp`.
+
+Optional: set `POSTBASE_MCP_BASE_URL` if the app cannot reach itself at the
+default `http://127.0.0.1:$PORT` when proxying tool calls.
 
 ## Environment variables
 
@@ -124,6 +166,7 @@ instead reads the frozen JSON and adds the database schemas at runtime.
 | `NEXTAUTH_SECRET` | — | **Required.** Signs Auth.js sessions/tokens. |
 | `NEXTAUTH_URL` | `http://localhost:3000` | Public URL of this instance. |
 | `POSTBASE_JWT_SECRET` | — | Signs Postbase API JWTs. |
+| `POSTBASE_MCP_BASE_URL` | `http://127.0.0.1:$PORT` | Base URL `/mcp` uses to call this instance's own REST API. |
 
 ## Notes & caveats
 
