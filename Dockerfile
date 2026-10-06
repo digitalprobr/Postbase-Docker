@@ -38,8 +38,9 @@ RUN pnpm --filter web build
 # ─── Runtime ──────────────────────────────────────────────────────────────────
 FROM node:22-alpine AS runner
 # psql (postgresql-client) is used by the entrypoint to wait for the database
-# and to apply the schema + migrations on startup.
-RUN apk add --no-cache postgresql-client
+# and to apply the schema + migrations on startup. curl is used by Coolify's
+# container healthcheck.
+RUN apk add --no-cache postgresql-client curl
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000

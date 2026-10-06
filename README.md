@@ -38,20 +38,19 @@ Source selection is configurable via build args:
 
 ### Startup / database initialization
 
-On start, `docker/entrypoint.sh`:
+The container **starts the web server immediately** so orchestrator healthchecks (Coolify/Docker) pass, then initializes the database **in the background**:
 
-1. waits until PostgreSQL accepts connections (retries for `DB_WAIT_RETRIES × DB_WAIT_INTERVAL` seconds),
+1. waits until PostgreSQL accepts connections (up to `DB_WAIT_RETRIES × DB_WAIT_INTERVAL` seconds),
 2. applies `scripts/init.sql` — creates the `_postbase` schema and the `uuid-ossp` / `pgcrypto` extensions,
-3. applies every `apps/web/drizzle/*.sql` migration in filename order,
-4. starts the Next.js standalone server on `0.0.0.0:$PORT`.
+3. applies every `apps/web/drizzle/*.sql` migration in filename order.
 
-Migration failures are **logged, not fatal**, so the server always starts (matching the upstream Railway entrypoint). Re-applying already-run migrations on restart is tolerated: existing objects raise errors that are logged and skipped. For a clean re-init, drop the data volume/database and redeploy.
+Initialization is **best-effort**: failures are logged but never stop the server, and the server never blocks on the database. If the database is unreachable the app still runs (API/dashboard calls fail until it is fixed) — restart the container afterwards to run initialization. Re-applying already-run migrations is tolerated (existing objects error and are skipped). For a clean re-init, drop the database/volume and redeploy.
 
 ## Deploy on Coolify
 
 1. Create an **Application** resource pointing at this repo (`main` branch).
 2. Build pack: **Dockerfile** (path: `Dockerfile`). Port: **3000**.
-3. Add a **PostgreSQL** database resource and link it, then set the environment variables:
+3. Add a **PostgreSQL** database resource and link it to this application (Coolify then injects `DATABASE_URL`), and set the environment variables:
 
    | Variable | Required | Notes |
    | --- | --- | --- |
@@ -131,7 +130,7 @@ DATABASE_URL="postgresql://..." pnpm db:push     # push the schema directly
 | `NEXTAUTH_SECRET` | — | **Required.** Signs Auth.js sessions/tokens. |
 | `NEXTAUTH_URL` | `http://localhost:3000` | Public URL of this instance. |
 | `POSTBASE_JWT_SECRET` | — | Signs Postbase API JWTs. |
-| `DB_WAIT_RETRIES` | `30` | Entrypoint: max attempts to reach Postgres before starting anyway. |
+| `DB_WAIT_RETRIES` | `60` | Entrypoint: max attempts to reach Postgres before giving up on init. |
 | `DB_WAIT_INTERVAL` | `2` | Entrypoint: seconds between connection attempts. |
 
 ## Notes & caveats
