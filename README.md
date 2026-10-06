@@ -45,7 +45,7 @@ The entrypoint runs **before** the web server, because Postbase's Next.js instru
 3. applies every `apps/web/drizzle/*.sql` migration in filename order,
 4. starts the Next.js standalone server on `0.0.0.0:$PORT`.
 
-Migration failures are logged but never fatal. If the database is unreachable the server is started anyway with a clear error (it will not pass a healthcheck until `DATABASE_URL` is fixed). The entrypoint also warns loudly if `DATABASE_URL` points at `localhost`/`127.0.0.1`, which can never work from inside the container. Re-applying already-run migrations is tolerated (existing objects error and are skipped).
+The entrypoint **fails fast (`exit 1` with a clear message)** when `DATABASE_URL` is missing or points at `localhost`/`127.0.0.1` — neither can ever work inside a container, and this turns a confusing 55-second "unhealthy" rollout into an immediate, readable error at the top of the log. If the database is merely slow to come up, it waits (bounded) and starts the server anyway; migration failures are logged but never fatal. Re-applying already-run migrations is tolerated (existing objects error and are skipped).
 
 ## Deploy on Coolify
 
