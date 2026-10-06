@@ -174,6 +174,24 @@ for f in $(ls /app/drizzle/*.sql 2>/dev/null | sort); do
 done
 echo "==> Database initialisation done."
 
+# ── Incremental schema patches (idempotent) ──────────────────────────────────
+# The Drizzle migrations shipped in the repository are older than the
+# application schema — notably _postbase.projects.user_column_defs has no
+# migration at all, so the app's `select ... user_column_defs ...` fails with
+# "column does not exist" (42703). This mirrors the patch step in upstream's
+# docker/entrypoint-railway.sh.
+PATCH_SQL="$SOCKET_DIR/schema-patches.sql"
+cat > "$PATCH_SQL" <<'SQL'
+ALTER TABLE "_postbase"."projects" ADD COLUMN IF NOT EXISTS "user_column_defs" jsonb DEFAULT '[]'::jsonb;
+ALTER TABLE "_postbase"."email_settings" ADD COLUMN IF NOT EXISTS "ses_smtp_username" text;
+ALTER TABLE "_postbase"."email_settings" ADD COLUMN IF NOT EXISTS "ses_smtp_password" text;
+SQL
+chmod 644 "$PATCH_SQL"
+
+echo "==> Applying schema patches..."
+psql_local -d "$POSTGRES_DB" -q -f "$PATCH_SQL" \
+  || echo "WARNING: schema patches failed. Continuing." >&2
+
 # ── Verify the app will be able to connect over TCP ──────────────────────────
 if ! "$PG_ISREADY" -h 127.0.0.1 -p 5432 -q; then
   dump_log

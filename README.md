@@ -101,6 +101,7 @@ docker run -p 3000:3000 \
 ## Notes & caveats
 
 - **The entrypoint fails loudly.** Every database step is checked; a failure prints a `FATAL:` block with the reason (and PostgreSQL's own log) and exits, instead of leaving a container whose only symptom is the app failing to connect. Check the container logs (`docker logs` / Coolify → *Logs*).
+- **Schema patches are applied after migrations.** The Drizzle migrations in the repo are older than the application schema (e.g. `_postbase.projects.user_column_defs` has no migration), so an idempotent patch step mirrors upstream's Railway entrypoint. Without it the dashboard fails with `column "user_column_defs" does not exist`.
 - **Data lives at `/data/postgres`.** Mount a persistent volume at `/data` or your database is recreated on each deploy.
 - **Single instance only.** The embedded PostgreSQL is not designed for horizontal scaling or multiple replicas.
 - **First boot is slower** (~15-25s) because `initdb` runs; later boots take a few seconds.
