@@ -38,13 +38,14 @@ Source selection is configurable via build args:
 
 ### Startup / database initialization
 
-The container **starts the web server immediately** so orchestrator healthchecks (Coolify/Docker) pass, then initializes the database **in the background**:
+The entrypoint runs **before** the web server, because Postbase's Next.js instrumentation hook queries `_postbase.cron_jobs` at boot — if the schema is missing the app aborts and nothing ever listens on `:3000`.
 
-1. waits until PostgreSQL accepts connections (up to `DB_WAIT_RETRIES × DB_WAIT_INTERVAL` seconds),
+1. waits until PostgreSQL accepts connections (bounded: `DB_WAIT_RETRIES × DB_WAIT_INTERVAL`, default 20 × 2s = 40s — deliberately under Coolify's ~55s healthcheck window),
 2. applies `scripts/init.sql` — creates the `_postbase` schema and the `uuid-ossp` / `pgcrypto` extensions,
-3. applies every `apps/web/drizzle/*.sql` migration in filename order.
+3. applies every `apps/web/drizzle/*.sql` migration in filename order,
+4. starts the Next.js standalone server on `0.0.0.0:$PORT`.
 
-Initialization is **best-effort**: failures are logged but never stop the server, and the server never blocks on the database. If the database is unreachable the app still runs (API/dashboard calls fail until it is fixed) — restart the container afterwards to run initialization. Re-applying already-run migrations is tolerated (existing objects error and are skipped). For a clean re-init, drop the database/volume and redeploy.
+Migration failures are logged but never fatal. If the database is unreachable the server is started anyway with a clear error (it will not pass a healthcheck until `DATABASE_URL` is fixed). The entrypoint also warns loudly if `DATABASE_URL` points at `localhost`/`127.0.0.1`, which can never work from inside the container. Re-applying already-run migrations is tolerated (existing objects error and are skipped).
 
 ## Deploy on Coolify
 
@@ -130,11 +131,13 @@ DATABASE_URL="postgresql://..." pnpm db:push     # push the schema directly
 | `NEXTAUTH_SECRET` | — | **Required.** Signs Auth.js sessions/tokens. |
 | `NEXTAUTH_URL` | `http://localhost:3000` | Public URL of this instance. |
 | `POSTBASE_JWT_SECRET` | — | Signs Postbase API JWTs. |
-| `DB_WAIT_RETRIES` | `60` | Entrypoint: max attempts to reach Postgres before giving up on init. |
+| `DB_WAIT_RETRIES` | `20` | Entrypoint: max attempts to reach Postgres (20 × 2s = 40s). |
 | `DB_WAIT_INTERVAL` | `2` | Entrypoint: seconds between connection attempts. |
 
 ## Notes & caveats
 
+- **The app requires the database at boot.** Postbase's instrumentation hook queries `_postbase.cron_jobs` on startup, so the container will not become healthy until `DATABASE_URL` is correct *and* the schema exists.
+- **`DATABASE_URL` must not use `localhost`/`127.0.0.1`** inside a container — that resolves to the app container itself. Use the Postgres service hostname, e.g. `postgresql://user:pass@postgres:5432/postbase`.
 - **Migrations run automatically** on container start via `docker/entrypoint.sh` (see above); failures are logged but never block startup.
 - Building requires **network access** to clone the upstream repository at build time.
 - The image is built from upstream `main` by default. Bump `POSTBASE_REF` to upgrade deliberately.

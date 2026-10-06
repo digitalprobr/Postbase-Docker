@@ -2,23 +2,24 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Postbase container entrypoint
 #
-# The web server is started IMMEDIATELY so orchestrator healthchecks (Coolify,
-# Docker, Kubernetes) pass. Database initialization then runs in the
-# background:
-#
-#   1. wait for PostgreSQL to accept connections
+#   1. wait for PostgreSQL to accept connections (bounded)
 #   2. apply scripts/init.sql          (schema + extensions)
 #   3. apply apps/web/drizzle/*.sql     (migrations, in filename order)
+#   4. start the Next.js standalone server
 #
-# Initialization is best-effort: failures are logged, never fatal, and never
-# delay the server from listening on 0.0.0.0:$PORT.
+# These steps run BEFORE the server starts: Postbase's Next.js instrumentation
+# hook queries _postbase.cron_jobs during boot, so the app aborts (and nothing
+# listens on :3000) if the database/schema is not ready.
+#
+# The wait is bounded so a missing/unreachable database cannot blow past the
+# orchestrator healthcheck window (Coolify: 5s start period + 10 x 5s ~= 55s).
 # ─────────────────────────────────────────────────────────────────────────────
 set -u
 
 PORT="${PORT:-3000}"
 export PORT
 
-DB_WAIT_RETRIES="${DB_WAIT_RETRIES:-60}"
+DB_WAIT_RETRIES="${DB_WAIT_RETRIES:-20}"   # 20 x 2s = 40s max, under Coolify's window
 DB_WAIT_INTERVAL="${DB_WAIT_INTERVAL:-2}"
 
 # ── Apply a single .sql file (failures are logged, not fatal) ─────────────────
@@ -30,57 +31,63 @@ apply_sql() {
   fi
 }
 
-# ── Database initialization (runs in the background) ──────────────────────────
-init_db() {
-  echo "==> [db-init] waiting for database to become reachable..."
+# ── Validate DATABASE_URL ─────────────────────────────────────────────────────
+db_configured=0
+if [ -z "${DATABASE_URL:-}" ]; then
+  echo "ERROR: DATABASE_URL is not set — the database cannot be initialized." >&2
+  echo "       Link a PostgreSQL resource in Coolify (it injects DATABASE_URL)." >&2
+else
+  db_configured=1
+  case "$DATABASE_URL" in
+    *@localhost:*|*@127.0.0.1:*)
+      echo "ERROR: DATABASE_URL points at localhost/127.0.0.1." >&2
+      echo "       Inside this container that is the app itself, not your database." >&2
+      echo "       Use the Postgres service hostname, e.g. postgresql://user:pass@postgres:5432/postbase" >&2
+      ;;
+  esac
+fi
+
+# ── Initialize the database ───────────────────────────────────────────────────
+if [ "$db_configured" -eq 1 ]; then
+  echo "==> Waiting for database to become reachable..."
   db_ready=0
   attempt=1
   while [ "$attempt" -le "$DB_WAIT_RETRIES" ]; do
     if psql "$DATABASE_URL" -tAc 'SELECT 1' >/dev/null 2>&1; then
       db_ready=1
-      echo "==> [db-init] database is reachable (attempt ${attempt})."
+      echo "==> Database is reachable (attempt ${attempt})."
       break
     fi
-    # Log sparsely so a slow/absent database does not flood the logs.
-    if [ $((attempt % 10)) -eq 0 ]; then
-      echo "  -> [db-init] still waiting (attempt ${attempt}/${DB_WAIT_RETRIES})..."
+    if [ $((attempt % 5)) -eq 0 ]; then
+      echo "  -> still waiting (attempt ${attempt}/${DB_WAIT_RETRIES})..."
     fi
     attempt=$((attempt + 1))
     sleep "$DB_WAIT_INTERVAL"
   done
 
-  if [ "$db_ready" -ne 1 ]; then
-    echo "WARNING: [db-init] database not reachable after ${DB_WAIT_RETRIES} attempts." >&2
-    echo "         Skipping initialization. Restart the container once it is up." >&2
-    return 0
-  fi
+  if [ "$db_ready" -eq 1 ]; then
+    echo "==> Creating base schema and extensions..."
+    if [ -f /app/scripts/init.sql ]; then
+      apply_sql /app/scripts/init.sql
+    else
+      echo "  -> /app/scripts/init.sql not found, skipping."
+    fi
 
-  echo "==> [db-init] creating base schema and extensions..."
-  if [ -f /app/scripts/init.sql ]; then
-    apply_sql /app/scripts/init.sql
+    if [ -d /app/drizzle ]; then
+      echo "==> Applying Drizzle migrations..."
+      # `ls | sort` preserves migration order (0000_, 0001_, ...).
+      for f in $(ls /app/drizzle/*.sql 2>/dev/null | sort); do
+        apply_sql "$f"
+      done
+    fi
+    echo "==> Database initialization done."
   else
-    echo "  -> /app/scripts/init.sql not found, skipping."
+    echo "WARNING: database not reachable after ${DB_WAIT_RETRIES} attempts." >&2
+    echo "         Starting the server anyway; it will not be healthy until DATABASE_URL is fixed." >&2
   fi
-
-  if [ -d /app/drizzle ]; then
-    echo "==> [db-init] applying Drizzle migrations..."
-    # `ls | sort` preserves migration order (0000_, 0001_, ...).
-    for f in $(ls /app/drizzle/*.sql 2>/dev/null | sort); do
-      apply_sql "$f"
-    done
-  fi
-
-  echo "==> [db-init] done."
-}
-
-if [ -n "${DATABASE_URL:-}" ]; then
-  init_db &
-else
-  echo "WARNING: DATABASE_URL is not set — skipping database initialization." >&2
-  echo "         Link a Postgres resource (or set DATABASE_URL) and restart." >&2
 fi
 
-# ── Start Next.js immediately ────────────────────────────────────────────────
+# ── Start Next.js ────────────────────────────────────────────────────────────
 # HOSTNAME=0.0.0.0 is required — the standalone server binds to localhost by
 # default, which a container proxy cannot reach.
 echo "==> Starting Next.js server on 0.0.0.0:${PORT}..."
