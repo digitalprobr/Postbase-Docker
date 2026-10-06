@@ -1,33 +1,36 @@
 # postbase (deploy)
 
-Deployment wrapper for **[Postbase](https://www.getpostbase.com/docs/deploy-docker)** — the self-hosted auth + database platform for Next.js.
+All-in-one deployment for **[Postbase](https://www.getpostbase.com/docs/deploy-docker)** — the self-hosted auth + database platform for Next.js.
 
-This repository deliberately contains **no application source**. Its `Dockerfile` clones the upstream project ([`harshalone/postbase`](https://github.com/harshalone/postbase)) at build time and produces a small runtime image. That keeps this repo to a few files and makes it trivial to redeploy / bump versions.
+One container runs **PostgreSQL 18 + the Next.js app** together, so there is **no external database to configure**. The Postbase source is cloned at build time, so this repository stays tiny.
 
 ## Contents
 
 | File | Purpose |
 | --- | --- |
-| `Dockerfile` | Multi-stage build. Clones upstream, runs `pnpm install` + `pnpm --filter web build`, ships the Next.js **standalone** server. |
-| `docker/entrypoint.sh` | Container entrypoint: waits for Postgres, applies `scripts/init.sql` + `apps/web/drizzle/*.sql`, then starts the server. |
-| `docker-compose.yml` | Local stack: PostgreSQL 18 + the app (ports `5432` and `3000`). |
-| `.env.example` | Template for all required/optional environment variables. |
+| `Dockerfile` | Stage 1 clones and builds the Next.js **standalone** app; stage 2 adds PostgreSQL 18, `supervisor` and the app. |
+| `docker/entrypoint.sh` | Initialises the embedded cluster, runs `scripts/init.sql` + Drizzle migrations, then hands off to supervisord. |
+| `docker/supervisord.conf` | Supervises the `postgres` and `node` processes. |
+| `docker-compose.yml` | Local run: one service + a `/data` volume. |
+| `.env.example` | Template for database credentials and secrets. |
 
-## How the image is built
+## How the image works
 
-The builder stage:
+**Build stage** — clones the upstream monorepo (`--depth 1`), `pnpm install --frozen-lockfile`, `pnpm --filter web build`, producing `apps/web/.next/standalone`.
 
-1. clones the upstream monorepo (`--depth 1`) into `/app`,
-2. installs the pnpm workspace from the committed lockfile (`pnpm install --frozen-lockfile`),
-3. builds the web app (`pnpm --filter web build`) which emits `apps/web/.next/standalone`.
+**Runtime stage** — `node:22-alpine` + `postgresql18`, `supervisor`, `su-exec`, `curl`.
 
-The runtime stage only contains the standalone server + static assets and runs:
+On start, `docker/entrypoint.sh`:
 
-```
-node apps/web/server.js
-```
+1. locates the PostgreSQL binaries (Alpine puts them in `/usr/libexec/postgresql18`),
+2. `initdb`s `/data/postgres` — **first run only**,
+3. starts PostgreSQL, sets `POSTGRES_PASSWORD`, creates `POSTGRES_DB`,
+4. applies `scripts/init.sql` (schema + `uuid-ossp`/`pgcrypto`) and every `apps/web/drizzle/*.sql` in filename order,
+5. stops the temporary server and `exec`s supervisord, which keeps PostgreSQL (priority 10) and the app (priority 20) running.
 
-on `0.0.0.0:3000`.
+Migrations run **before** the app starts, because Postbase's Next.js instrumentation hook queries `_postbase.cron_jobs` at boot.
+
+> `DATABASE_URL` is derived inside the container as `postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@127.0.0.1:5432/<POSTGRES_DB>`. Any `DATABASE_URL` you set is ignored (a note is logged) — this is what makes the stack immune to a leftover `localhost` value.
 
 Source selection is configurable via build args:
 
@@ -36,112 +39,74 @@ Source selection is configurable via build args:
 | `POSTBASE_REPO` | `https://github.com/harshalone/postbase.git` | Git repository to clone. |
 | `POSTBASE_REF` | `main` | Branch or tag to build. |
 
-### Startup / database initialization
-
-The entrypoint runs **before** the web server, because Postbase's Next.js instrumentation hook queries `_postbase.cron_jobs` at boot — if the schema is missing the app aborts and nothing ever listens on `:3000`.
-
-1. waits until PostgreSQL accepts connections (bounded: `DB_WAIT_RETRIES × DB_WAIT_INTERVAL`, default 20 × 2s = 40s — deliberately under Coolify's ~55s healthcheck window),
-2. applies `scripts/init.sql` — creates the `_postbase` schema and the `uuid-ossp` / `pgcrypto` extensions,
-3. applies every `apps/web/drizzle/*.sql` migration in filename order,
-4. starts the Next.js standalone server on `0.0.0.0:$PORT`.
-
-The entrypoint **fails fast (`exit 1` with a clear message)** when `DATABASE_URL` is missing or points at `localhost`/`127.0.0.1` — neither can ever work inside a container, and this turns a confusing 55-second "unhealthy" rollout into an immediate, readable error at the top of the log. If the database is merely slow to come up, it waits (bounded) and starts the server anyway; migration failures are logged but never fatal. Re-applying already-run migrations is tolerated (existing objects error and are skipped).
-
 ## Deploy on Coolify
 
 1. Create an **Application** resource pointing at this repo (`main` branch).
 2. Build pack: **Dockerfile** (path: `Dockerfile`). Port: **3000**.
-3. Add a **PostgreSQL** database resource and link it to this application (Coolify then injects `DATABASE_URL`), and set the environment variables:
+3. Set the environment variables:
 
    | Variable | Required | Notes |
    | --- | --- | --- |
-   | `DATABASE_URL` | ✅ | Connection string to your Postgres resource. |
    | `NEXTAUTH_SECRET` | ✅ | `openssl rand -base64 32` |
-   | `NEXTAUTH_URL` | ✅ | Public URL, e.g. `https://<your-app-domain>` |
+   | `NEXTAUTH_URL` | ✅ | Your public URL, e.g. `https://my-postbase.example.com` |
    | `POSTBASE_JWT_SECRET` | ➖ | Recommended. `openssl rand -base64 32` |
+   | `POSTGRES_PASSWORD` | ➖ | Change from the `postbase` default for production. |
+   | `POSTGRES_USER`, `POSTGRES_DB` | ➖ | Defaults to `postbase`. |
 
-4. Deploy. The entrypoint waits for Postgres and initializes the schema + migrations automatically (see below).
+   > You do **not** need a database resource, and you do **not** need to set `DATABASE_URL`.
 
-To pin a specific release, pass a build arg, e.g. `POSTBASE_REF=v0.3.16`.
+4. **Add a persistent volume** (recommended): application → *Persistent Storages* → add a volume with destination **`/data`**. Without it, PostgreSQL data is recreated on every deploy.
+5. Deploy, then open `/setup` to create the admin account.
 
-## Local development / self-hosted with Docker Compose
+To pin a release, pass a build arg, e.g. `POSTBASE_REF=v0.3.16`.
+
+## Local / self-hosted with Docker Compose
 
 ```bash
 cp .env.example .env          # then set NEXTAUTH_SECRET (openssl rand -base64 32)
-docker compose up -d          # PostgreSQL :5432 + app :3000
-# Initialize the database (see below), then open:
-#   http://localhost:3000/dashboard
+docker compose up -d          # app + embedded PostgreSQL on :3000
+# open http://localhost:3000/setup
 ```
 
-Useful commands:
-
 ```bash
-docker compose logs -f app      # tail the app logs
-docker compose down             # stop (data preserved in the postgres_data volume)
+docker compose logs -f app      # tail logs
+docker compose down             # stop (data kept in the postbase_data volume)
 docker compose down -v          # stop and wipe the database
 ```
 
 ### Build the image directly
 
 ```bash
-docker build -t postbase-app .
+docker build -t postbase .
 docker run -p 3000:3000 \
-  -e DATABASE_URL="postgresql://postbase:postbase@host:5432/postbase" \
+  -v postbase_data:/data \
   -e NEXTAUTH_SECRET="$(openssl rand -base64 32)" \
   -e NEXTAUTH_URL="http://localhost:3000" \
-  postbase-app
+  postbase
 ```
-
-## Database initialization (automatic)
-
-The app requires the internal `_postbase` schema and its tables to exist. This is done for you on container start:
-
-- `scripts/init.sql` runs first (schema + extensions),
-- then `apps/web/drizzle/*.sql` migrations run in order.
-
-Both files are taken from the cloned upstream source at build time — nothing to run manually.
-
-**Manual fallback** (e.g. a database that the container cannot reach, or a hosted Postgres you prefer to prepare yourself):
-
-```sql
-CREATE SCHEMA IF NOT EXISTS _postbase;
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-```
-
-```bash
-git clone --depth 1 https://github.com/harshalone/postbase.git
-cd postbase/apps/web
-pnpm install
-DATABASE_URL="postgresql://..." pnpm db:push     # push the schema directly
-```
-
-> `pg_cron` and `pgmq` are optional; install them from the dashboard's Integrations page if needed.
 
 ## Environment variables
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `DATABASE_URL` | `postgresql://postbase:postbase@localhost:5432/postbase` | PostgreSQL connection string. Inside Compose it points at the `postgres` service. |
-| `POSTGRES_USER` | `postbase` | Compose only — Postgres superuser. |
-| `POSTGRES_PASSWORD` | `postbase` | Compose only — Postgres password. |
-| `POSTGRES_DB` | `postbase` | Compose only — database name. |
-| `POSTGRES_PORT` | `5432` | Compose only — host port for Postgres. |
+| `POSTGRES_USER` | `postbase` | Superuser created in the embedded cluster. |
+| `POSTGRES_PASSWORD` | `postbase` | Password for that user (kept in sync on every start). |
+| `POSTGRES_DB` | `postbase` | Application database, created if missing. |
+| `PORT` | `3000` | Port the Next.js server binds to. |
 | `APP_PORT` | `3000` | Compose only — host port for the app. |
 | `NEXTAUTH_SECRET` | — | **Required.** Signs Auth.js sessions/tokens. |
 | `NEXTAUTH_URL` | `http://localhost:3000` | Public URL of this instance. |
 | `POSTBASE_JWT_SECRET` | — | Signs Postbase API JWTs. |
-| `DB_WAIT_RETRIES` | `20` | Entrypoint: max attempts to reach Postgres (20 × 2s = 40s). |
-| `DB_WAIT_INTERVAL` | `2` | Entrypoint: seconds between connection attempts. |
 
 ## Notes & caveats
 
-- **The app requires the database at boot.** Postbase's instrumentation hook queries `_postbase.cron_jobs` on startup, so the container will not become healthy until `DATABASE_URL` is correct *and* the schema exists.
-- **`DATABASE_URL` must not use `localhost`/`127.0.0.1`** inside a container — that resolves to the app container itself. Use the Postgres service hostname, e.g. `postgresql://user:pass@postgres:5432/postbase`.
-- **Migrations run automatically** on container start via `docker/entrypoint.sh` (see above); failures are logged but never block startup.
-- Building requires **network access** to clone the upstream repository at build time.
-- The image is built from upstream `main` by default. Bump `POSTBASE_REF` to upgrade deliberately.
-- Data lives in the `postgres_data` volume — back it up, and note `docker compose down -v` deletes it.
+- **Data lives at `/data/postgres`.** Mount a persistent volume at `/data` or your database is recreated on each deploy.
+- **Single instance only.** The embedded PostgreSQL is not designed for horizontal scaling or multiple replicas.
+- **First boot is slower** (~15-25s) because `initdb` runs; later boots take a few seconds.
+- **No `pg_cron` / `pgmq`.** Postbase's cron jobs use `node-cron`; install the optional extensions from the dashboard's Integrations page if you need them.
+- **Building requires network access** to clone the upstream repository.
+- **Migrations are replayed on every start** and are idempotent (`IF NOT EXISTS`); already-existing objects log warnings that are safely ignored.
+- The admin account is **not** seeded — it is created on first visit to `/setup`.
 
 ## Links
 

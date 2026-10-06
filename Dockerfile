@@ -1,19 +1,18 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Postbase — self-contained app image (Next.js standalone build)
+# Postbase — all-in-one image (PostgreSQL 18 + Next.js standalone in one container)
 #
 # Self-hosted deploy per https://www.getpostbase.com/docs/deploy-docker
 #
-# This image does NOT require the Postbase source to live in this repository:
-# the builder stage clones the upstream project (harshalone/postbase) and builds
-# it from there. Override the source with build args if you want a fork/tag:
-#   docker build --build-arg POSTBASE_REF=v0.3.16 -t postbase-app .
+# PostgreSQL runs INSIDE this container and the app connects to it over
+# 127.0.0.1:5432, so no external database is required. The data directory is
+# /data/postgres — mount a persistent volume at /data to keep your data.
 #
-# At runtime, docker/entrypoint.sh waits for PostgreSQL and applies
-# scripts/init.sql + apps/web/drizzle/*.sql before starting the server.
+# The Postbase source is cloned at build time, so this repository stays tiny:
+#   docker build --build-arg POSTBASE_REF=v0.3.16 -t postbase .
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ─── Base ─────────────────────────────────────────────────────────────────────
-FROM node:22-alpine AS base
+# ─── Stage 1: build the Next.js app ──────────────────────────────────────────
+FROM node:22-alpine AS builder
 # git is needed to clone the upstream source; ca-certificates for HTTPS.
 RUN apk add --no-cache git ca-certificates \
     && npm install -g pnpm@9
@@ -24,9 +23,6 @@ WORKDIR /app
 ARG POSTBASE_REPO=https://github.com/harshalone/postbase.git
 ARG POSTBASE_REF=main
 
-
-# ─── Builder ──────────────────────────────────────────────────────────────────
-FROM base AS builder
 # 1. Fetch the upstream monorepo (pnpm workspace: apps/web).
 RUN git clone --depth 1 --branch "${POSTBASE_REF}" "${POSTBASE_REPO}" .
 # 2. Install workspace dependencies from the committed lockfile.
@@ -35,31 +31,38 @@ RUN pnpm install --frozen-lockfile
 RUN pnpm --filter web build
 
 
-# ─── Runtime ──────────────────────────────────────────────────────────────────
+# ─── Stage 2: all-in-one runtime (PostgreSQL + app) ──────────────────────────
 FROM node:22-alpine AS runner
-# psql (postgresql-client) is used by the entrypoint to wait for the database
-# and to apply the schema + migrations on startup. curl is used by Coolify's
-# container healthcheck.
-RUN apk add --no-cache postgresql-client curl
+
+# postgresql18  → the embedded database server (creates the `postgres` user)
+# supervisor    → runs postgres + the app together
+# su-exec       → drop privileges when setting up the cluster as `postgres`
+# curl          → used by Coolify's container healthcheck
+RUN apk add --no-cache postgresql18 postgresql18-client postgresql-common \
+                       supervisor su-exec curl
+
 WORKDIR /app
-ENV NODE_ENV=production
-ENV PORT=3000
-ENV NEXT_TELEMETRY_DISABLED=1
-# Standalone server binds to localhost by default — must be 0.0.0.0 in Docker.
-ENV HOSTNAME=0.0.0.0
+ENV NODE_ENV=production \
+    PORT=3000 \
+    NEXT_TELEMETRY_DISABLED=1 \
+    HOSTNAME=0.0.0.0
 
 # Next.js standalone output + static assets + public files
 COPY --from=builder /app/apps/web/.next/standalone ./
 COPY --from=builder /app/apps/web/.next/static ./apps/web/.next/static
 COPY --from=builder /app/apps/web/public ./apps/web/public
 
-# SQL applied on startup: base schema/extensions + Drizzle migrations
+# SQL applied on first start: base schema/extensions + Drizzle migrations
 COPY --from=builder /app/scripts /app/scripts
 COPY --from=builder /app/apps/web/drizzle /app/drizzle
 
-# Entrypoint: wait for Postgres → initialize schema/migrations → start the server
+# Process supervisor (postgres + app) and the entrypoint
+COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+
+# PostgreSQL data directory — mount a persistent volume here to keep data.
+RUN mkdir -p /data/postgres /var/log/supervisor
 
 EXPOSE 3000
 

@@ -1,35 +1,15 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Postbase — self-hosted Docker Compose stack
+# Postbase — all-in-one self-hosted stack
 # https://www.getpostbase.com/docs/deploy-docker
 #
 #   1. cp .env.example .env   (and set NEXTAUTH_SECRET)
 #   2. docker compose up -d
-#   3. open http://localhost:3000/dashboard
+#   3. open http://localhost:3000/setup   (create the admin account)
 #
-# The app container waits for Postgres and applies scripts/init.sql +
-# apps/web/drizzle/*.sql automatically on startup (from the cloned source).
-#
-# Postgres runs on 5432, the Postbase app on 3000.
+# The image bundles PostgreSQL 18 — there is no separate database container.
+# PostgreSQL data lives in the `postbase_data` volume, mounted at /data.
 # ─────────────────────────────────────────────────────────────────────────────
 services:
-  postgres:
-    image: postgres:18
-    container_name: postbase_db
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postbase}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postbase}
-      POSTGRES_DB: ${POSTGRES_DB:-postbase}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postbase} -d ${POSTGRES_DB:-postbase}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   app:
     build:
       context: .
@@ -37,16 +17,20 @@ services:
     image: postbase_app
     container_name: postbase_app
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postbase}:${POSTGRES_PASSWORD:-postbase}@postgres:5432/${POSTGRES_DB:-postbase}
+      # Embedded PostgreSQL (user/db are created on first start).
+      POSTGRES_USER: ${POSTGRES_USER:-postbase}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postbase}
+      POSTGRES_DB: ${POSTGRES_DB:-postbase}
+      # Authentication
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?NEXTAUTH_SECRET is required - set it in .env (openssl rand -base64 32)}
       POSTBASE_JWT_SECRET: ${POSTBASE_JWT_SECRET:-}
     ports:
       - "${APP_PORT:-3000}:3000"
+    volumes:
+      # Keeps the embedded PostgreSQL data directory across restarts.
+      - postbase_data:/data
 
 volumes:
-  postgres_data:
+  postbase_data:

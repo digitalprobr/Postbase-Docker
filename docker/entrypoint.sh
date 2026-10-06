@@ -1,110 +1,130 @@
 #!/bin/sh
 # ─────────────────────────────────────────────────────────────────────────────
-# Postbase container entrypoint
+# Postbase all-in-one container entrypoint
 #
-#   0. validate DATABASE_URL (fail fast if it can never work)
-#   1. wait for PostgreSQL to accept connections (bounded)
-#   2. apply scripts/init.sql          (schema + extensions)
-#   3. apply apps/web/drizzle/*.sql     (migrations, in filename order)
-#   4. start the Next.js standalone server
+# PostgreSQL 18 and the Next.js app live in the SAME container, so no external
+# database is needed. On start:
 #
-# These steps run BEFORE the server starts: Postbase's Next.js instrumentation
-# hook queries _postbase.cron_jobs during boot, so the app aborts (and nothing
-# listens on :3000) if the database/schema is not ready.
+#   1. locate the PostgreSQL server binaries
+#   2. initialise the cluster in /data/postgres (first run only)
+#   3. start PostgreSQL, set the password, create the database
+#   4. apply scripts/init.sql + apps/web/drizzle/*.sql
+#   5. stop PostgreSQL and hand off to supervisord (which supervises
+#      `postgres` + `node app`)
 #
-# An unreachable database is fatal for the app, so an obviously-broken
-# DATABASE_URL exits immediately with a readable message instead of waiting out
-# the orchestrator healthcheck window and reporting a misleading "unhealthy".
+# Migrations run before the app starts because Postbase's Next.js
+# instrumentation hook queries _postbase.cron_jobs during boot.
 # ─────────────────────────────────────────────────────────────────────────────
 set -u
 
+POSTGRES_USER="${POSTGRES_USER:-postbase}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-postbase}"
+POSTGRES_DB="${POSTGRES_DB:-postbase}"
 PORT="${PORT:-3000}"
 export PORT
 
-DB_WAIT_RETRIES="${DB_WAIT_RETRIES:-20}"   # 20 x 2s = 40s max, under Coolify's window
-DB_WAIT_INTERVAL="${DB_WAIT_INTERVAL:-2}"
+# The embedded database always listens on 127.0.0.1:5432. Any DATABASE_URL
+# supplied by the platform is replaced so a leftover "localhost" value from
+# .env.example cannot break the deployment.
+PGDATA=/data/postgres
+PROVIDED_DATABASE_URL="${DATABASE_URL:-}"
+export DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}"
+export PGPASSWORD="$POSTGRES_PASSWORD"
 
-# ── Fail fast with a readable message ─────────────────────────────────────────
-fatal() {
-  echo "============================================================" >&2
-  echo "FATAL: $1" >&2
-  shift
-  for line in "$@"; do
-    echo "       $line" >&2
+if [ -n "$PROVIDED_DATABASE_URL" ] && [ "$PROVIDED_DATABASE_URL" != "$DATABASE_URL" ]; then
+  echo "NOTE: ignoring the provided DATABASE_URL — using the embedded PostgreSQL at 127.0.0.1:5432."
+fi
+
+# ── Locate the PostgreSQL binaries ───────────────────────────────────────────
+# Their location depends on the Alpine package layout.
+find_bin() {
+  for dir in /usr/libexec/postgresql18 /usr/lib/postgresql18/bin /usr/lib/postgresql/18/bin /usr/bin; do
+    if [ -x "$dir/$1" ]; then
+      echo "$dir/$1"
+      return 0
+    fi
   done
-  echo "============================================================" >&2
-  exit 1
+  return 1
 }
 
-if [ -z "${DATABASE_URL:-}" ]; then
-  fatal "DATABASE_URL is not set — Postbase cannot start without a database." \
-        "In Coolify: create a PostgreSQL resource and link it to this" \
-        "application (Coolify then injects DATABASE_URL), or set DATABASE_URL" \
-        "manually to your Postgres connection string. Then redeploy."
+PG_SERVER="$(find_bin postgres)" || { echo "FATAL: PostgreSQL 'postgres' binary not found." >&2; exit 1; }
+PG_INITDB="$(find_bin initdb)"   || { echo "FATAL: PostgreSQL 'initdb' binary not found."   >&2; exit 1; }
+PG_CTL="$(find_bin pg_ctl)"      || { echo "FATAL: PostgreSQL 'pg_ctl' binary not found."   >&2; exit 1; }
+PSQL="$(find_bin psql)"          || { echo "FATAL: PostgreSQL 'psql' binary not found."     >&2; exit 1; }
+SUPERVISORD="$(command -v supervisord 2>/dev/null || echo /usr/bin/supervisord)"
+SUEXEC="$(command -v su-exec 2>/dev/null || echo /sbin/su-exec)"
+
+echo "==> PostgreSQL binaries: $(dirname "$PG_SERVER")"
+echo "==> Database: user=${POSTGRES_USER} db=${POSTGRES_DB} data=${PGDATA}"
+
+run_as_postgres() { "$SUEXEC" postgres "$@"; }
+
+# ── Prepare the data directory ───────────────────────────────────────────────
+mkdir -p "$PGDATA" /var/log/supervisor
+chown -R postgres:postgres "$PGDATA"
+# Stale pid file from an unclean shutdown would prevent PostgreSQL from starting.
+rm -f "$PGDATA/postmaster.pid"
+
+# ── Initialise the cluster (first run only) ──────────────────────────────────
+if [ ! -f "$PGDATA/PG_VERSION" ]; then
+  echo "==> Initialising PostgreSQL cluster in ${PGDATA} (first run)..."
+  run_as_postgres "$PG_INITDB" -D "$PGDATA" \
+    --username="$POSTGRES_USER" \
+    --auth-local=trust \
+    --auth-host=md5
+  {
+    echo "listen_addresses = '127.0.0.1'"
+    echo "port = 5432"
+  } >> "$PGDATA/postgresql.conf"
 fi
 
-case "$DATABASE_URL" in
-  *@localhost:*|*@localhost/*|*@127.0.0.1:*|*@127.0.0.1/*)
-    fatal "DATABASE_URL points at localhost/127.0.0.1." \
-          "Inside this container localhost is the app itself, not your database," \
-          "so the connection can never succeed. Use the Postgres service hostname:" \
-          "  postgresql://postgres:<password>@<postgres-host>:5432/postgres" \
-          "In Coolify, link the PostgreSQL resource to this application." \
-          "Also remove the POSTGRES_* / APP_PORT variables — they are only used by" \
-          "the local docker-compose.yml."
-    ;;
-esac
+# Allow password logins over TCP (idempotent).
+if ! grep -q '127.0.0.1/32' "$PGDATA/pg_hba.conf" 2>/dev/null; then
+  echo "host all all 127.0.0.1/32 md5" >> "$PGDATA/pg_hba.conf"
+fi
 
-# ── Apply a single .sql file (failures are logged, not fatal) ─────────────────
-apply_sql() {
-  file="$1"
-  echo "  -> applying $(basename "$file")"
-  if ! psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$file"; then
-    echo "WARNING: '$(basename "$file")' failed. Continuing." >&2
-  fi
-}
+# ── Start PostgreSQL for initialisation ──────────────────────────────────────
+echo "==> Starting PostgreSQL for initialisation..."
+run_as_postgres "$PG_CTL" -D "$PGDATA" -w -t 60 start
 
-# ── Wait for PostgreSQL ───────────────────────────────────────────────────────
-echo "==> Waiting for database to become reachable..."
-db_ready=0
-attempt=1
-while [ "$attempt" -le "$DB_WAIT_RETRIES" ]; do
-  if psql "$DATABASE_URL" -tAc 'SELECT 1' >/dev/null 2>&1; then
-    db_ready=1
-    echo "==> Database is reachable (attempt ${attempt})."
-    break
-  fi
-  if [ $((attempt % 5)) -eq 0 ]; then
-    echo "  -> still waiting (attempt ${attempt}/${DB_WAIT_RETRIES})..."
-  fi
-  attempt=$((attempt + 1))
-  sleep "$DB_WAIT_INTERVAL"
-done
+# Keep the password in sync with POSTGRES_PASSWORD (self-correcting on restarts).
+"$PSQL" -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d template1 -v ON_ERROR_STOP=1 -q \
+  -c "ALTER USER \"$POSTGRES_USER\" WITH PASSWORD '$POSTGRES_PASSWORD';"
 
-# ── Initialize the database ───────────────────────────────────────────────────
-if [ "$db_ready" -eq 1 ]; then
-  echo "==> Creating base schema and extensions..."
-  if [ -f /app/scripts/init.sql ]; then
-    apply_sql /app/scripts/init.sql
-  else
-    echo "  -> /app/scripts/init.sql not found, skipping."
-  fi
+# Create the application database if it does not exist yet.
+DB_EXISTS="$("$PSQL" -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d template1 -tAc \
+  "SELECT 1 FROM pg_database WHERE datname='$POSTGRES_DB'")"
+if [ "$DB_EXISTS" != "1" ]; then
+  echo "==> Creating database ${POSTGRES_DB}..."
+  "$PSQL" -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d template1 -v ON_ERROR_STOP=1 -q \
+    -c "CREATE DATABASE \"$POSTGRES_DB\" OWNER \"$POSTGRES_USER\";"
+fi
 
-  if [ -d /app/drizzle ]; then
-    echo "==> Applying Drizzle migrations..."
-    # `ls | sort` preserves migration order (0000_, 0001_, ...).
-    for f in $(ls /app/drizzle/*.sql 2>/dev/null | sort); do
-      apply_sql "$f"
-    done
-  fi
-  echo "==> Database initialization done."
+# ── Base schema + extensions (idempotent) ────────────────────────────────────
+echo "==> Creating base schema and extensions..."
+if [ -f /app/scripts/init.sql ]; then
+  "$PSQL" -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q \
+    -f /app/scripts/init.sql \
+    || echo "WARNING: scripts/init.sql failed. Continuing." >&2
 else
-  echo "WARNING: database not reachable after ${DB_WAIT_RETRIES} attempts." >&2
-  echo "         Starting the server anyway; it will not be healthy until DATABASE_URL is fixed." >&2
+  echo "  -> /app/scripts/init.sql not found, skipping."
 fi
 
-# ── Start Next.js ────────────────────────────────────────────────────────────
-# HOSTNAME=0.0.0.0 is required — the standalone server binds to localhost by
-# default, which a container proxy cannot reach.
-echo "==> Starting Next.js server on 0.0.0.0:${PORT}..."
-exec env HOSTNAME=0.0.0.0 node /app/apps/web/server.js
+# ── Drizzle migrations (filename order: 0000_, 0001_, ...) ───────────────────
+echo "==> Applying Drizzle migrations..."
+for f in $(ls /app/drizzle/*.sql 2>/dev/null | sort); do
+  echo "  -> $(basename "$f")"
+  "$PSQL" -h 127.0.0.1 -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q -f "$f" \
+    || echo "WARNING: $(basename "$f") failed. Continuing." >&2
+done
+echo "==> Database initialisation done."
+
+# ── Hand the database over to supervisord ────────────────────────────────────
+# Stop the temporary server so supervisord owns the single PostgreSQL process.
+run_as_postgres "$PG_CTL" -D "$PGDATA" -w -t 60 stop
+# Symlink with a stable name referenced by supervisord.conf.
+ln -sf "$PG_SERVER" /usr/local/bin/pg-server
+mkdir -p /var/log/supervisor
+
+echo "==> Starting supervisord (PostgreSQL + Next.js on 0.0.0.0:${PORT})..."
+exec "$SUPERVISORD" -c /etc/supervisor/conf.d/supervisord.conf
