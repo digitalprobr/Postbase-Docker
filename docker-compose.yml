@@ -4,8 +4,10 @@
 #
 #   1. cp .env.example .env   (and set NEXTAUTH_SECRET)
 #   2. docker compose up -d
-#   3. apply the DB schema to Postgres (upstream: cd apps/web && pnpm db:push)
-#   4. open http://localhost:3000/dashboard
+#   3. open http://localhost:3000/dashboard
+#
+# The app container waits for Postgres and applies scripts/init.sql +
+# apps/web/drizzle/*.sql automatically on startup (from the cloned source).
 #
 # Postgres runs on 5432, the Postbase app on 3000.
 # ─────────────────────────────────────────────────────────────────────────────

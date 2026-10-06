@@ -7,6 +7,9 @@
 # the builder stage clones the upstream project (harshalone/postbase) and builds
 # it from there. Override the source with build args if you want a fork/tag:
 #   docker build --build-arg POSTBASE_REF=v0.3.16 -t postbase-app .
+#
+# At runtime, docker/entrypoint.sh waits for PostgreSQL and applies
+# scripts/init.sql + apps/web/drizzle/*.sql before starting the server.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── Base ─────────────────────────────────────────────────────────────────────
@@ -34,6 +37,9 @@ RUN pnpm --filter web build
 
 # ─── Runtime ──────────────────────────────────────────────────────────────────
 FROM node:22-alpine AS runner
+# psql (postgresql-client) is used by the entrypoint to wait for the database
+# and to apply the schema + migrations on startup.
+RUN apk add --no-cache postgresql-client
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
@@ -46,6 +52,14 @@ COPY --from=builder /app/apps/web/.next/standalone ./
 COPY --from=builder /app/apps/web/.next/static ./apps/web/.next/static
 COPY --from=builder /app/apps/web/public ./apps/web/public
 
+# SQL applied on startup: base schema/extensions + Drizzle migrations
+COPY --from=builder /app/scripts /app/scripts
+COPY --from=builder /app/apps/web/drizzle /app/drizzle
+
+# Entrypoint: wait for Postgres → initialize schema/migrations → start the server
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+
 EXPOSE 3000
 
-CMD ["node", "apps/web/server.js"]
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,8 @@
+# Normalize line endings in the repository to LF.
+# Shell scripts MUST use LF — a CRLF shebang (#!/bin/sh\r) fails to execute on Linux.
+* text=auto
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
