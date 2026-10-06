@@ -4,7 +4,7 @@
 #
 #   1. cp .env.example .env   (and set NEXTAUTH_SECRET)
 #   2. docker compose up -d
-#   3. cd apps/web && pnpm install && pnpm db:push   (run migrations)
+#   3. apply the DB schema to Postgres (upstream: cd apps/web && pnpm db:push)
 #   4. open http://localhost:3000/dashboard
 #
 # Postgres runs on 5432, the Postbase app on 3000.
@@ -22,7 +22,6 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postbase} -d ${POSTGRES_DB:-postbase}"]
       interval: 5s
