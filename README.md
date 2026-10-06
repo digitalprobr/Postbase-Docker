@@ -85,6 +85,33 @@ docker run -p 3000:3000 \
   postbase
 ```
 
+## API documentation (Swagger)
+
+Open **`/docs`** for the Swagger UI. It renders **`/docs/openapi.json`**, which is
+built on every request from two sources:
+
+1. the REST endpoints the app is annotated with (`@swagger` JSDoc in
+   `apps/web/src/app/api/**`), and
+2. the **live database**, introspected automatically — one component schema per
+   table of every project schema (`proj_*`), with the real columns and types.
+
+How it is wired (all owned by this repo, so no upstream changes are needed):
+
+| Path | Role |
+| --- | --- |
+| `docker/web-override/apps/web/src/app/docs/page.tsx` | The `/docs` page (Swagger UI). |
+| `docker/web-override/apps/web/src/app/docs/openapi.json/route.ts` | Serves `/docs/openapi.json`. |
+| `docker/web-override/apps/web/src/lib/openapi-from-db.ts` | Introspects PostgreSQL → OpenAPI schemas. |
+| `docker/web-override/apps/web/scripts/generate-openapi.mjs` | Build-time: freezes the REST spec from the `@swagger` comments. |
+
+The overlay is copied over the upstream clone in the build stage, and
+`generate-openapi.mjs` runs **before** `next build`. This is required because the
+standalone image ships no `src/` sources, so upstream's runtime `next-swagger-doc`
+scan (used by the built-in `/docs/api`) has nothing to read in production; `/docs`
+instead reads the frozen JSON and adds the database schemas at runtime.
+
+> `/docs/api` (upstream) is left untouched; `/docs` is the supported entry point.
+
 ## Environment variables
 
 | Variable | Default | Description |
