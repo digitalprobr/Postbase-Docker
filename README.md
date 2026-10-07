@@ -1,8 +1,14 @@
-# postbase (deploy)
+# Postbase + Swagger + MCP (all-in-one deploy)
 
-All-in-one deployment for **[Postbase](https://www.getpostbase.com/docs/deploy-docker)** — the self-hosted auth + database platform for Next.js.
+Our image is **Postbase + Swagger + MCP** in one container — the self-hosted auth + database platform for Next.js ([Postbase docs](https://www.getpostbase.com/docs/deploy-docker)), plus a live **Swagger UI at `/docs`** and an auto-generated **MCP server at `/mcp`**.
 
 One image runs **PostgreSQL 18 + the Next.js app** together, so by default there is **no external database to configure** — or point it at **your own PostgreSQL** with a single environment variable (`POSTGRES_URL`). The Postbase source is cloned at build time, so this repository stays tiny.
+
+What you get:
+
+- **Postbase** — dashboard, auth, database API (`/setup`, `/api/*`).
+- **Swagger** — interactive docs at **`/docs`** backed by **`/docs/openapi.json`**, built from the app's `@swagger` REST annotations **plus the live `proj_*` tables** introspected from PostgreSQL.
+- **MCP** — Streamable-HTTP server at **`/mcp`** that turns every OpenAPI operation into a callable tool (`tools/list` / `tools/call`), with the same key/RLS auth as the REST API.
 
 ## Contents
 
