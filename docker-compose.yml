@@ -39,6 +39,11 @@ services:
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?NEXTAUTH_SECRET is required - set it in .env (openssl rand -base64 32)}
       POSTBASE_JWT_SECRET: ${POSTBASE_JWT_SECRET:-}
+      # Server-side fallback key used by the public-signup overlay
+      # (docker/web-override .../signup/route.ts): when a guest calls signup
+      # without Authorization, the server validates this key internally.
+      # Optional — signup also works fully key-free without it.
+      POSTBASE_SERVICE_KEY: ${POSTBASE_SERVICE_KEY:-}
     extra_hosts:
       # Makes host.docker.internal resolve to the Docker host (needed on Linux
       # when your PostgreSQL runs on the host instead of in the container).
