@@ -8,6 +8,10 @@
 #
 # The image bundles PostgreSQL 18 — there is no separate database container.
 # PostgreSQL data lives in the `postbase_data` volume, mounted at /data.
+#
+# To use YOUR OWN PostgreSQL instead, set POSTGRES_URL in .env to a reachable
+# host (e.g. host.docker.internal:5432 for a database on the Docker host).
+# 127.0.0.1 inside the container is the container itself.
 # ─────────────────────────────────────────────────────────────────────────────
 services:
   app:
@@ -18,7 +22,16 @@ services:
     container_name: postbase_app
     restart: unless-stopped
     environment:
-      # Embedded PostgreSQL (user/db are created on first start).
+      # ── Database ────────────────────────────────────────────────────────────
+      # Leave both unset to use the PostgreSQL embedded in the image (default).
+      # Set POSTGRES_URL to YOUR OWN PostgreSQL to use it instead: the embedded
+      # server is skipped and the schema/migrations run against your database.
+      # Use a host the container can reach — for a database on the Docker host
+      # that is host.docker.internal (not 127.0.0.1, which is the container).
+      POSTGRES_URL: ${POSTGRES_URL:-}
+      DATABASE_URL: ${DATABASE_URL:-}
+      # Embedded PostgreSQL (user/db are created on first start). Ignored when
+      # POSTGRES_URL/DATABASE_URL targets a non-loopback host.
       POSTGRES_USER: ${POSTGRES_USER:-postbase}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postbase}
       POSTGRES_DB: ${POSTGRES_DB:-postbase}
@@ -26,10 +39,15 @@ services:
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?NEXTAUTH_SECRET is required - set it in .env (openssl rand -base64 32)}
       POSTBASE_JWT_SECRET: ${POSTBASE_JWT_SECRET:-}
+    extra_hosts:
+      # Makes host.docker.internal resolve to the Docker host (needed on Linux
+      # when your PostgreSQL runs on the host instead of in the container).
+      - "host.docker.internal:host-gateway"
     ports:
       - "${APP_PORT:-3000}:3000"
     volumes:
-      # Keeps the embedded PostgreSQL data directory across restarts.
+      # Keeps the EMBEDDED PostgreSQL data directory across restarts.
+      # Unused (and harmless) when POSTGRES_URL points at an external database.
       - postbase_data:/data
 
 volumes:

@@ -1,15 +1,21 @@
 #!/bin/sh
 # ─────────────────────────────────────────────────────────────────────────────
-# Postbase all-in-one container entrypoint
+# Postbase container entrypoint
 #
-# PostgreSQL 18 and the Next.js app live in the SAME container, so no external
-# database is needed. On start:
+# Two database modes, chosen automatically from POSTGRES_URL / DATABASE_URL:
 #
-#   1. locate the PostgreSQL server binaries
-#   2. initialise the cluster in /data/postgres (first run only)
-#   3. start PostgreSQL, set the password, create the database
-#   4. apply scripts/init.sql + apps/web/drizzle/*.sql
-#   5. stop PostgreSQL and hand off to supervisord (`postgres` + `node app`)
+#   EMBEDDED (default) — PostgreSQL 18 lives in this container:
+#     1. locate the PostgreSQL server binaries
+#     2. initialise the cluster in /data/postgres (first run only)
+#     3. start PostgreSQL, set the password, create the database
+#     4. apply scripts/init.sql + apps/web/drizzle/*.sql
+#     5. stop PostgreSQL and hand off to supervisord (`postgres` + `node app`)
+#
+#   EXTERNAL — POSTGRES_URL points at YOUR OWN (non-loopback) PostgreSQL:
+#     1. never initdb and never start the embedded server
+#     2. wait for your database to accept connections
+#     3. apply scripts/init.sql + apps/web/drizzle/*.sql to it
+#     4. run the app directly (`node apps/web/server.js`), no supervisord
 #
 # Every database step is checked: a failure prints the reason and exits instead
 # of leaving a half-initialised container whose only symptom is the app failing
@@ -31,15 +37,60 @@ PGDATA=/data/postgres
 SOCKET_DIR=/tmp
 PG_LOG=/tmp/postgres-start.log
 
-# The embedded database always listens on 127.0.0.1:5432. Any DATABASE_URL
-# supplied by the platform is replaced so a leftover "localhost" value from
-# .env.example cannot break the deployment.
-PROVIDED_DATABASE_URL="${DATABASE_URL:-}"
-export DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}"
-export PGPASSWORD="$POSTGRES_PASSWORD"
+# ── Connection mode: embedded (default) or an external PostgreSQL ────────────
+# Leave POSTGRES_URL / DATABASE_URL unset to use the PostgreSQL bundled in this
+# image (that is the default). Set it to a REACHABLE host to use your OWN
+# PostgreSQL: the embedded server is then skipped entirely and the schema and
+# migrations are applied to that database instead.
+#
+# Loopback hosts (127.0.0.1 / localhost / ::1) always mean the embedded server,
+# because that is where it listens — so a leftover ".env.example" value cannot
+# break the deployment. NOTE: 127.0.0.1 inside a container is the container
+# itself; to reach a database on the Docker host use host.docker.internal.
+url_host() {
+  _u="${1#*://}"      # strip scheme
+  _u="${_u##*@}"      # strip credentials (longest match up to the last @)
+  _u="${_u%%/*}"      # strip path / database
+  _u="${_u%%:*}"      # strip :port
+  printf '%s' "$_u"
+}
 
-if [ -n "$PROVIDED_DATABASE_URL" ] && [ "$PROVIDED_DATABASE_URL" != "$DATABASE_URL" ]; then
-  echo "NOTE: ignoring the provided DATABASE_URL — using the embedded PostgreSQL at 127.0.0.1:5432."
+url_port() {
+  _u="${1#*://}"
+  _u="${_u##*@}"
+  _u="${_u%%/*}"
+  case "$_u" in
+    *:*) printf '%s' "${_u##*:}" ;;
+    *)   printf '5432' ;;
+  esac
+}
+
+EMBEDDED_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}"
+CANDIDATE_URL="${POSTGRES_URL:-${DATABASE_URL:-}}"
+DB_MODE=embedded
+EXTERNAL_URL=""
+
+if [ -n "$CANDIDATE_URL" ]; then
+  case "$(url_host "$CANDIDATE_URL")" in
+    ''|127.0.0.1|localhost|::1)
+      if [ "$CANDIDATE_URL" != "$EMBEDDED_URL" ]; then
+        echo "NOTE: POSTGRES_URL/DATABASE_URL points at loopback — using the embedded PostgreSQL."
+        echo "      For an EXTERNAL database use a reachable host, e.g. host.docker.internal."
+      fi
+      ;;
+    *)
+      DB_MODE=external
+      EXTERNAL_URL="$CANDIDATE_URL"
+      ;;
+  esac
+fi
+
+if [ "$DB_MODE" = external ]; then
+  # The user's own database; psql reads user/password/db straight from the URI.
+  export DATABASE_URL="$EXTERNAL_URL"
+else
+  export DATABASE_URL="$EMBEDDED_URL"
+  export PGPASSWORD="$POSTGRES_PASSWORD"
 fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -62,7 +113,7 @@ dump_log() {
   fi
 }
 
-# ── Locate the PostgreSQL binaries ───────────────────────────────────────────
+# ── Locate the PostgreSQL client binaries (needed in BOTH modes) ─────────────
 # Their location depends on the Alpine package layout.
 find_bin() {
   for dir in /usr/libexec/postgresql18 /usr/lib/postgresql18/bin /usr/lib/postgresql/18/bin /usr/bin; do
@@ -74,16 +125,74 @@ find_bin() {
   return 1
 }
 
-PG_SERVER="$(find_bin postgres)"    || die "PostgreSQL 'postgres' binary not found."
-PG_INITDB="$(find_bin initdb)"      || die "PostgreSQL 'initdb' binary not found."
-PG_CTL="$(find_bin pg_ctl)"         || die "PostgreSQL 'pg_ctl' binary not found."
 PSQL="$(find_bin psql)"             || die "PostgreSQL 'psql' binary not found."
 PG_ISREADY="$(find_bin pg_isready)" || die "PostgreSQL 'pg_isready' binary not found."
+
+# ── External mode: migrate the user's PostgreSQL, then run ONLY the app ──────
+if [ "$DB_MODE" = external ]; then
+  EXT_HOST="$(url_host "$EXTERNAL_URL")"
+  EXT_PORT="$(url_port "$EXTERNAL_URL")"
+
+  echo "==> Mode: EXTERNAL PostgreSQL at ${EXT_HOST}:${EXT_PORT}"
+  echo "==> Database: db=${POSTGRES_DB} (credentials taken from POSTGRES_URL)"
+
+  echo "==> Waiting for PostgreSQL at ${EXT_HOST}:${EXT_PORT}..."
+  tries=0
+  until "$PG_ISREADY" -h "$EXT_HOST" -p "$EXT_PORT" -q; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 60 ]; then
+      die "PostgreSQL at ${EXT_HOST}:${EXT_PORT} is not reachable after 120s." \
+          "If the database runs on the Docker host use host.docker.internal" \
+          "(docker-compose adds the extra_hosts mapping for you)." \
+          "127.0.0.1 inside this container is the container itself."
+    fi
+    sleep 2
+  done
+
+  # ── Base schema + extensions (idempotent) ──────────────────────────────────
+  if [ -f /app/scripts/init.sql ]; then
+    echo "==> Creating base schema and extensions..."
+    "$PSQL" "$EXTERNAL_URL" -q -v ON_ERROR_STOP=1 -f /app/scripts/init.sql \
+      || echo "WARNING: scripts/init.sql failed. Continuing." >&2
+  else
+    echo "  -> /app/scripts/init.sql not found, skipping."
+  fi
+
+  # ── Drizzle migrations (filename order: 0000_, 0001_, ...) ─────────────────
+  echo "==> Applying Drizzle migrations..."
+  for f in $(ls /app/drizzle/*.sql 2>/dev/null | sort); do
+    echo "  -> $(basename "$f")"
+    "$PSQL" "$EXTERNAL_URL" -q -v ON_ERROR_STOP=1 -f "$f" \
+      || echo "WARNING: $(basename "$f") failed. Continuing." >&2
+  done
+
+  # ── Incremental schema patches (idempotent) ────────────────────────────────
+  EXT_PATCH_SQL=/tmp/schema-patches.sql
+  cat > "$EXT_PATCH_SQL" <<'SQL'
+ALTER TABLE "_postbase"."projects" ADD COLUMN IF NOT EXISTS "user_column_defs" jsonb DEFAULT '[]'::jsonb;
+ALTER TABLE "_postbase"."email_settings" ADD COLUMN IF NOT EXISTS "ses_smtp_username" text;
+ALTER TABLE "_postbase"."email_settings" ADD COLUMN IF NOT EXISTS "ses_smtp_password" text;
+SQL
+  echo "==> Applying schema patches..."
+  "$PSQL" "$EXTERNAL_URL" -q -f "$EXT_PATCH_SQL" \
+    || echo "WARNING: schema patches failed. Continuing." >&2
+
+  echo "==> Database ready. Starting the Next.js app on 0.0.0.0:${PORT}..."
+  export NODE_ENV=production
+  export HOSTNAME=0.0.0.0
+  exec /usr/local/bin/node /app/apps/web/server.js
+fi
+
+# ── Embedded mode: PostgreSQL runs inside this container ─────────────────────
+PG_SERVER="$(find_bin postgres)" || die "PostgreSQL 'postgres' binary not found."
+PG_INITDB="$(find_bin initdb)"   || die "PostgreSQL 'initdb' binary not found."
+PG_CTL="$(find_bin pg_ctl)"      || die "PostgreSQL 'pg_ctl' binary not found."
 SUPERVISORD="$(command -v supervisord 2>/dev/null || echo /usr/bin/supervisord)"
 SUEXEC="$(command -v su-exec 2>/dev/null || echo /sbin/su-exec)"
 
 [ -x "$SUEXEC" ] || die "su-exec not found; cannot run commands as the postgres user."
 
+echo "==> Mode: EMBEDDED PostgreSQL"
 echo "==> PostgreSQL binaries: $(dirname "$PG_SERVER")"
 echo "==> Database: user=${POSTGRES_USER} db=${POSTGRES_DB} data=${PGDATA}"
 
