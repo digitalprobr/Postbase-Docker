@@ -48,24 +48,39 @@ FROM node:22-alpine AS pgbuilder
 
 # build-base       → gcc/make toolchain
 # git              → fetch the extension sources
-# postgresql18-dev → server headers + PGXS makefiles
+# postgresql18-dev → server headers + the PGXS makefiles
+# postgresql18     → the `pg_config` binary. Alpine splits the PostgreSQL 18
+#                    server this way: postgresql18-dev ships the PGXS makefiles
+#                    but NOT pg_config, so without the server package
+#                    $(PG_CONFIG) expands to nothing and make dies with
+#                    "No rule to make target 'install'".
 # libpq-dev        → pg_cron links against libpq
-ARG PGMQ_REF=v1.11.0
-ARG PG_CRON_REF=v1.6.7
-ARG PG_CONFIG=/usr/libexec/postgresql18/pg_config
+ARG PGMQ_REF=v1.13.0
+ARG PG_CRON_REF=v1.6.8
 
-RUN apk add --no-cache build-base git postgresql18-dev libpq-dev
+RUN apk add --no-cache build-base git postgresql18 postgresql18-dev libpq-dev
+
+# pg_config's path depends on the Alpine package split, so it is resolved here
+# instead of being hardcoded: /usr/libexec/postgresql18/pg_config, or
+# /usr/bin/pg_config (a symlink pointing into it). The discovered binary is
+# exposed as `pg_config` on PATH for the PGXS builds below, and a missing one
+# fails early with a clear message instead of a cryptic make error.
+RUN REAL_PG_CONFIG="$(command -v pg_config || ls /usr/libexec/postgresql*/pg_config 2>/dev/null | head -n 1 || true)" \
+    && [ -n "${REAL_PG_CONFIG}" ] && [ -x "${REAL_PG_CONFIG}" ] \
+    && echo "pg_config: ${REAL_PG_CONFIG} ($("${REAL_PG_CONFIG}" --version))" \
+    && ln -sf "${REAL_PG_CONFIG}" /usr/local/bin/pg_config \
+    || { echo "ERROR: pg_config not found — the postgresql18 package must be installed for PGXS builds." >&2; exit 1; }
 
 RUN git clone --depth 1 --branch "${PGMQ_REF}" https://github.com/pgmq/pgmq.git /tmp/pgmq \
     && cd /tmp/pgmq/pgmq-extension \
-    && make PG_CONFIG="${PG_CONFIG}" \
-    && make install PG_CONFIG="${PG_CONFIG}" \
+    && make PG_CONFIG=pg_config \
+    && make install PG_CONFIG=pg_config \
     && rm -rf /tmp/pgmq
 
 RUN git clone --depth 1 --branch "${PG_CRON_REF}" https://github.com/citusdata/pg_cron.git /tmp/pg_cron \
     && cd /tmp/pg_cron \
-    && make PG_CONFIG="${PG_CONFIG}" \
-    && make install PG_CONFIG="${PG_CONFIG}" \
+    && make PG_CONFIG=pg_config \
+    && make install PG_CONFIG=pg_config \
     && rm -rf /tmp/pg_cron
 
 
