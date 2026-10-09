@@ -95,10 +95,12 @@ FROM node:22-alpine AS runner
 RUN apk add --no-cache postgresql18 postgresql18-client postgresql18-contrib postgresql-common \
                        supervisor su-exec curl
 
-# Optional extensions compiled in stage 2 (pgmq + pg_cron). Copied into the same
-# directories Alpine's own extensions use, so CREATE EXTENSION finds them and the
-# dashboard's Integrations page can enable them.
-COPY --from=pgbuilder /usr/lib/postgresql18/pgmq.so    /usr/lib/postgresql18/
+# The optional extensions built in stage 2, copied into the same directories
+# Alpine's own extensions use, so CREATE EXTENSION finds them and the dashboard's
+# Integrations page can enable them.
+# pgmq is a pure PL/pgSQL extension: PGXS installs only pgmq.control plus the
+# sql/pgmq--*.sql scripts — there is NO pgmq.so to copy.
+# pg_cron is a C module and does ship pg_cron.so, which must be copied.
 COPY --from=pgbuilder /usr/lib/postgresql18/pg_cron.so /usr/lib/postgresql18/
 COPY --from=pgbuilder /usr/share/postgresql18/extension/pgmq*    /usr/share/postgresql18/extension/
 COPY --from=pgbuilder /usr/share/postgresql18/extension/pg_cron* /usr/share/postgresql18/extension/

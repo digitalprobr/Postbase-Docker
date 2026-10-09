@@ -11,7 +11,7 @@ This image (`postbase` + Swagger + MCP) ships three layers of extensions:
 | --- | --- |
 | PostgreSQL core | `plpgsql` |
 | `postgresql18-contrib` | 45 standard extensions (`pgcrypto`, `uuid-ossp`, `pg_trgm`, `hstore`, …) |
-| Compiled at build time (Dockerfile `pgbuilder` stage) | `pgmq` 1.13.0, `pg_cron` 1.6.8 |
+| Installed at build time (Dockerfile `pgbuilder` stage) | `pgmq` 1.13.0 (pure SQL), `pg_cron` 1.6.8 (compiled to `pg_cron.so`) |
 
 ## How to install an extension
 
@@ -266,7 +266,7 @@ SELECT jobid, schedule, jobname FROM cron.job ORDER BY jobid;
   `integrations/page.tsx` and `api/dashboard/[projectId]/queues/route.ts`
   (the two installable modules), `Dockerfile` (upstream compiles the same two
   extensions).
-- This repository: `Dockerfile` (`pgbuilder` stage compiles `pgmq` + `pg_cron`),
+- This repository: `Dockerfile` (`pgbuilder` stage installs `pgmq` — pure SQL, no shared library — and compiles `pg_cron`),
   `docker/entrypoint.sh` (`shared_preload_libraries`).
 - Alpine packages for PostgreSQL 18 (`pkgs.alpinelinux.org`, branch v3.23);
   the `pg_config` binary that PGXS needs is provided by the **`postgresql18`** server package — `postgresql18-dev` ships the PGXS makefiles but *not* `pg_config` — so the `pgbuilder` stage installs both.
