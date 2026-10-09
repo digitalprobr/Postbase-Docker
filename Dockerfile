@@ -38,15 +38,55 @@ RUN cd /app/apps/web && node scripts/generate-openapi.mjs
 RUN pnpm --filter web build
 
 
-# ─── Stage 2: all-in-one runtime (PostgreSQL + app) ──────────────────────────
+# ─── Stage 2: compile the optional PostgreSQL extensions (pgmq + pg_cron) ────
+# The Alpine repositories ship no pgmq build for PostgreSQL 18 (the only pgmq
+# package there targets PostgreSQL 16) and pg_cron is version-locked elsewhere,
+# so both are compiled from source against the SAME PostgreSQL 18 the runtime
+# uses. Building on the same base image guarantees the musl/ICU ABI of the
+# resulting .so files matches the server that will load them.
+FROM node:22-alpine AS pgbuilder
+
+# build-base       → gcc/make toolchain
+# git              → fetch the extension sources
+# postgresql18-dev → server headers + PGXS makefiles
+# libpq-dev        → pg_cron links against libpq
+ARG PGMQ_REF=v1.11.0
+ARG PG_CRON_REF=v1.6.7
+ARG PG_CONFIG=/usr/libexec/postgresql18/pg_config
+
+RUN apk add --no-cache build-base git postgresql18-dev libpq-dev
+
+RUN git clone --depth 1 --branch "${PGMQ_REF}" https://github.com/pgmq/pgmq.git /tmp/pgmq \
+    && cd /tmp/pgmq/pgmq-extension \
+    && make PG_CONFIG="${PG_CONFIG}" \
+    && make install PG_CONFIG="${PG_CONFIG}" \
+    && rm -rf /tmp/pgmq
+
+RUN git clone --depth 1 --branch "${PG_CRON_REF}" https://github.com/citusdata/pg_cron.git /tmp/pg_cron \
+    && cd /tmp/pg_cron \
+    && make PG_CONFIG="${PG_CONFIG}" \
+    && make install PG_CONFIG="${PG_CONFIG}" \
+    && rm -rf /tmp/pg_cron
+
+
+# ─── Stage 3: all-in-one runtime (PostgreSQL + app) ──────────────────────────
 FROM node:22-alpine AS runner
 
-# postgresql18  → the embedded database server (creates the `postgres` user)
-# supervisor    → runs postgres + the app together
-# su-exec       → drop privileges when setting up the cluster as `postgres`
-# curl          → used by Coolify's container healthcheck
-RUN apk add --no-cache postgresql18 postgresql18-client postgresql-common \
+# postgresql18         → the embedded database server (creates the `postgres` user)
+# postgresql18-contrib → pgcrypto, uuid-ossp, pg_trgm, hstore, … (used by init.sql)
+# supervisor           → runs postgres + the app together
+# su-exec              → drop privileges when setting up the cluster as `postgres`
+# curl                 → used by Coolify's container healthcheck
+RUN apk add --no-cache postgresql18 postgresql18-client postgresql18-contrib postgresql-common \
                        supervisor su-exec curl
+
+# Optional extensions compiled in stage 2 (pgmq + pg_cron). Copied into the same
+# directories Alpine's own extensions use, so CREATE EXTENSION finds them and the
+# dashboard's Integrations page can enable them.
+COPY --from=pgbuilder /usr/lib/postgresql18/pgmq.so    /usr/lib/postgresql18/
+COPY --from=pgbuilder /usr/lib/postgresql18/pg_cron.so /usr/lib/postgresql18/
+COPY --from=pgbuilder /usr/share/postgresql18/extension/pgmq*    /usr/share/postgresql18/extension/
+COPY --from=pgbuilder /usr/share/postgresql18/extension/pg_cron* /usr/share/postgresql18/extension/
 
 WORKDIR /app
 ENV NODE_ENV=production \

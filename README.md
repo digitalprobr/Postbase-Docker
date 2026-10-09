@@ -24,7 +24,7 @@ What you get:
 
 **Build stage** — clones the upstream monorepo (`--depth 1`), `pnpm install --frozen-lockfile`, `pnpm --filter web build`, producing `apps/web/.next/standalone`.
 
-**Runtime stage** — `node:22-alpine` + `postgresql18`, `supervisor`, `su-exec`, `curl`.
+**Runtime stage** — `node:22-alpine` + `postgresql18`, `postgresql18-contrib`, `supervisor`, `su-exec`, `curl`, plus the `pgmq` and `pg_cron` builds produced by an intermediate **`pgbuilder` stage**.
 
 On start, `docker/entrypoint.sh`:
 
@@ -214,7 +214,7 @@ default `http://127.0.0.1:$PORT` when proxying tool calls.
 - **External mode needs a reachable host.** `127.0.0.1` inside the container is the container itself; use `host.docker.internal` for a database on the Docker host.
 - **Single instance only.** The embedded PostgreSQL is not designed for horizontal scaling or multiple replicas.
 - **First boot is slower** (~15-25s) because `initdb` runs; later boots take a few seconds.
-- **No `pg_cron` / `pgmq`.** Postbase's cron jobs use `node-cron`; install the optional extensions from the dashboard's Integrations page if you need them.
+- **Optional extensions are prebuilt.** `pgmq` and `pg_cron` are compiled from source during the build (see the `pgbuilder` stage) and copied into the image, and `postgresql18-contrib` adds `pgcrypto`/`uuid-ossp`/`pg_trgm`/`hstore`/… — so the dashboard's **Integrations** page can enable them (`CREATE EXTENSION pgmq` / `pg_cron` works out of the box). `pg_cron` needs `shared_preload_libraries`, which `entrypoint.sh` sets automatically. Pin the extension versions with the `PGMQ_REF` / `PG_CRON_REF` build args.
 - **Building requires network access** to clone the upstream repository.
 - **Migrations are replayed on every start** and are idempotent (`IF NOT EXISTS`); already-existing objects log warnings that are safely ignored.
 - The admin account is **not** seeded — it is created on first visit to `/setup`.

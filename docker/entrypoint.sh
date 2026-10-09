@@ -237,6 +237,18 @@ if [ ! -f "$PGDATA/PG_VERSION" ]; then
   echo "==> Cluster initialised."
 fi
 
+# ── Preload pg_cron (optional extension shipped by the image) ────────────────
+# pgmq needs no preloading — CREATE EXTENSION pgmq is enough. pg_cron, however,
+# only works when its library is loaded at server start, so the GUC has to live
+# in postgresql.conf. Idempotent: only appended when not already set.
+if ! grep -q "^shared_preload_libraries" "$PGDATA/postgresql.conf" 2>/dev/null; then
+  echo "shared_preload_libraries = 'pg_cron'" >> "$PGDATA/postgresql.conf"
+  echo "==> pg_cron will be preloaded (shared_preload_libraries)."
+fi
+if ! grep -q "^cron.database_name" "$PGDATA/postgresql.conf" 2>/dev/null; then
+  echo "cron.database_name = '${POSTGRES_DB}'" >> "$PGDATA/postgresql.conf"
+fi
+
 # Allow password logins over TCP for the app (idempotent).
 if ! grep -q '127.0.0.1/32' "$PGDATA/pg_hba.conf" 2>/dev/null; then
   echo "host all all 127.0.0.1/32 md5" >> "$PGDATA/pg_hba.conf"
