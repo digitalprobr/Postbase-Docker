@@ -148,6 +148,44 @@ standalone image ships no `src/` sources, so upstream's runtime `next-swagger-do
 scan (used by the built-in `/docs/api`) has nothing to read in production; `/docs`
 instead reads the frozen JSON and adds the database schemas at runtime.
 
+## Dashboard patches (web-override)
+
+Upstream dashboard bugs that this repo fixes at **build time** — same overlay
+mechanism as above, so no upstream change and no fork is needed.
+
+| Path | Role |
+| --- | --- |
+| `docker/web-override/apps/web/scripts/patch-rls-dashboard.mjs` | Build-time: fixes the **RLS Policies** tab crash. |
+
+**Symptom:** Database → Tables → click a table → **RLS Policies** dies with
+
+```
+Application error: a client-side exception has occurred while loading …
+Uncaught TypeError: Cannot read properties of undefined (reading 'tablename')
+```
+
+**Cause:** the tab button seeded the RLS selection synchronously
+(`onClick={() => { setTab(id); if (id === "rls" && selectedTable) setSelectedRlsTable(selectedTable); }}`)
+while the RLS table list is only fetched *after* the tab switches
+(`useEffect` on `tab === "rls"`). On that first render `rlsTables` is still
+empty, so `rlsTables.find((x) => x.tablename === selectedRlsTable)!` returned
+`undefined` and `t.tablename` threw.
+
+The script — run in the build stage after the overlay and before
+`next build` — makes three surgical changes to
+`src/app/dashboard/(protected)/[projectId]/database/tables/page.tsx`:
+
+1. the tab button only switches tabs (no premature selection),
+2. the Tables-tab selection is carried into RLS only once `rlsTables` has
+   loaded, a selection whose table was dropped/renamed is cleared, and RLS state
+   is reset when the project changes,
+3. the render guards the lookup (`if (!t)` → *"Select a table to view its
+   policies"*) and shows a loading state instead of dereferencing `undefined`.
+
+It is **idempotent** (re-runs report *already applied*) and **fails the build**
+if an anchor is missing in both raw and patched form — so bumping `POSTBASE_REF`
+can never ship a dashboard where the fix silently disappeared.
+
 > `/docs/api` (upstream) is left untouched; `/docs` is the supported entry point.
 
 ## MCP endpoint (`/mcp`)

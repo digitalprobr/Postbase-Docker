@@ -34,6 +34,14 @@ COPY docker/web-override/apps/web/ /app/apps/web/
 # 4. Freeze the REST part of the spec from the @swagger JSDoc in src/app/api
 #    while the sources are still present (they are NOT shipped at runtime).
 RUN cd /app/apps/web && node scripts/generate-openapi.mjs
+# 4b. Patch the dashboard "RLS Policies" tab (upstream bug). The tab button
+#     seeded its selected table synchronously — before the RLS table list was
+#     fetched — so `rlsTables.find(...)` returned undefined and `t.tablename`
+#     threw "Cannot read properties of undefined (reading 'tablename')",
+#     killing the page with "Application error: a client-side exception".
+#     The script touches only that page and FAILS THE BUILD if upstream's code
+#     no longer matches, so the fix can never silently disappear.
+RUN cd /app/apps/web && node scripts/patch-rls-dashboard.mjs
 # 5. Produce the Next.js standalone build (apps/web/.next/standalone).
 RUN pnpm --filter web build
 
